@@ -74,7 +74,12 @@ function cleanMotd(text) {
   return text.replace(/§[0-9a-fk-or]/gi, '').trim();
 }
 
-async function fetchMCData(ip) {
+const DEFAULT_BEDROCK_PORT = 19132;
+
+// Fetches live Java + Bedrock status. Java is retried once (with a short delay)
+// before being declared offline, so a single dropped packet / lag spike doesn't
+// falsely flag the server as down. Bedrock is treated as optional/best-effort.
+async function fetchMCData(ip, bedrockPort) {
   let host = ip;
   let port = 25565;
 
@@ -83,37 +88,122 @@ async function fetchMCData(ip) {
     host = parts[0];
     port = parseInt(parts[1]) || 25565;
   }
+  const bPort = parseInt(bedrockPort) || DEFAULT_BEDROCK_PORT;
 
-  let result = null;
+  let javaResult = null;
+  let javaOnline = false;
 
-  try {
-    result = await mcs.status(host, port, { timeout: 8000, enableSRV: !ip.includes(':') });
-  } catch (err1) {
+  for (let attempt = 0; attempt < 2 && !javaOnline; attempt++) {
     try {
-      result = await mcs.status(host, port, { timeout: 8000, enableSRV: false });
-    } catch (err2) {
-      return { isOnline: false, playersOnline: '0/0', version: 'N/A', motd: 'Server is Offline or Starting...' };
+      javaResult = await mcs.status(host, port, { timeout: 7000, enableSRV: !ip.includes(':') });
+      javaOnline = true;
+    } catch (err) {
+      if (attempt === 0) await new Promise(r => setTimeout(r, 1200));
     }
   }
 
-  if (result) {
-    let playersOnline = (result.players && result.players.online !== undefined) ? `${result.players.online}/${result.players.max}` : '0/0';
-    let rawVersion = result.version && result.version.name ? result.version.name : '1.20+';
-    let version = cleanMotd(rawVersion) || '1.20+';
-    if (version.toLowerCase().includes('online') || version.length > 25) {
-      version = '1.20+';
+  let bedrockResult = null;
+  let bedrockOnline = false;
+  try {
+    bedrockResult = await mcs.statusBedrock(host, bPort, { timeout: 5000 });
+    bedrockOnline = true;
+  } catch (err) {
+    bedrockOnline = false;
+  }
+
+  const javaIp = `${host}:${port}`;
+  const bedrockIp = `${host}:${bPort}`;
+
+  if (!javaOnline && !bedrockOnline) {
+    return {
+      isOnline: false,
+      playersOnline: '0/0',
+      version: 'N/A',
+      motd: 'Server is Offline or Starting...',
+      playerList: [],
+      javaIp,
+      bedrockIp,
+      bedrockOnline: false
+    };
+  }
+
+  let playersOnline = '0/0';
+  let version = '1.20+';
+  let motd = 'Nethrion SMP Server';
+  let playerList = [];
+
+  if (javaOnline && javaResult) {
+    if (javaResult.players && javaResult.players.online !== undefined) {
+      playersOnline = `${javaResult.players.online}/${javaResult.players.max}`;
+      if (Array.isArray(javaResult.players.sample)) {
+        playerList = javaResult.players.sample
+          .map(p => cleanMotd(p && p.name))
+          .filter(Boolean);
+      }
+    }
+
+    const rawVersion = javaResult.version && javaResult.version.name ? javaResult.version.name : '';
+    const cleanedVersion = cleanMotd(rawVersion);
+    if (cleanedVersion && cleanedVersion.length <= 25 && !cleanedVersion.toLowerCase().includes('online')) {
+      version = cleanedVersion;
     }
 
     let rawMotd = '';
-    if (result.motd) {
-      if (result.motd.clean) rawMotd = result.motd.clean;
-      else if (result.motd.raw) rawMotd = result.motd.raw;
+    if (javaResult.motd) {
+      rawMotd = javaResult.motd.clean || javaResult.motd.raw || '';
     }
-    let motd = cleanMotd(rawMotd) || 'Nethrion SMP Server';
-    return { isOnline: true, playersOnline, version, motd };
+    const cleanedMotd = cleanMotd(rawMotd);
+    if (cleanedMotd) motd = cleanedMotd;
+  } else if (bedrockOnline && bedrockResult) {
+    if (bedrockResult.players && bedrockResult.players.online !== undefined) {
+      playersOnline = `${bedrockResult.players.online}/${bedrockResult.players.max}`;
+    }
+    const cleanedVersion = cleanMotd(bedrockResult.version && bedrockResult.version.name);
+    if (cleanedVersion) version = cleanedVersion;
+    const cleanedMotd = cleanMotd(bedrockResult.motd && (bedrockResult.motd.clean || bedrockResult.motd.raw));
+    if (cleanedMotd) motd = cleanedMotd;
   }
-  
-  return { isOnline: false, playersOnline: '0/0', version: 'N/A', motd: 'Server is Offline or Starting...' };
+
+  return { isOnline: true, playersOnline, version, motd, playerList, javaIp, bedrockIp, bedrockOnline };
+}
+
+// Builds the compact, minimal status embed shared by the auto-updating panel and `sp smp`.
+function buildMCEmbed(data) {
+  const { isOnline, playersOnline, version, motd, playerList, javaIp, bedrockIp, bedrockOnline } = data;
+
+  const embed = new EmbedBuilder().setTimestamp();
+
+  if (!isOnline) {
+    return embed
+      .setTitle('🔴 Nethrion SMP — Offline')
+      .setColor('#e74c3c')
+      .addFields(
+        { name: '🌐 Java IP', value: `\`${javaIp}\``, inline: true },
+        { name: '📱 Bedrock IP', value: `\`${bedrockIp}\``, inline: true }
+      )
+      .setDescription('Server is currently offline or restarting.')
+      .setFooter({ text: 'Auto-updates every 3 minutes' });
+  }
+
+  embed
+    .setTitle('🟢 Nethrion SMP — Online')
+    .setColor('#2ecc71')
+    .addFields(
+      { name: '🌐 Java IP', value: `\`${javaIp}\``, inline: true },
+      { name: '📱 Bedrock IP', value: bedrockOnline ? `\`${bedrockIp}\`` : '`Not available`', inline: true },
+      { name: '👥 Players', value: `\`${playersOnline}\``, inline: true },
+      { name: '🧩 Version', value: `\`${version}\``, inline: true }
+    );
+
+  if (playerList.length > 0) {
+    const shown = playerList.slice(0, 6);
+    const extra = playerList.length > shown.length ? ` +${playerList.length - shown.length} more` : '';
+    embed.addFields({ name: '🎮 Online Now', value: shown.join(', ') + extra, inline: false });
+  }
+
+  embed.setDescription(`*${motd.length > 90 ? motd.slice(0, 90) + '…' : motd}*`);
+  embed.setFooter({ text: 'Auto-updates every 3 minutes' });
+  return embed;
 }
 
 async function updateMCStatus() {
@@ -128,31 +218,8 @@ async function updateMCStatus() {
     if (!message) return;
 
     const serverIp = db.mcStatus.ip;
-    const { isOnline, playersOnline, version, motd } = await fetchMCData(serverIp);
-
-    const embed = new EmbedBuilder().setTimestamp();
-
-    if (isOnline) {
-      embed
-        .setTitle('🟢 MINECRAFT SERVER STATUS: ONLINE')
-        .setColor('#2ecc71')
-        .addFields(
-          { name: '🌐 Server IP', value: `\`${serverIp}\``, inline: true },
-          { name: '👥 Players Online', value: `\`${playersOnline}\``, inline: true },
-          { name: '📌 Version', value: `\`${version}\``, inline: true },
-          { name: '📝 Description', value: `\`\`\`${motd}\`\`\`` }
-        )
-        .setFooter({ text: 'Auto-updated every 3 minutes' });
-    } else {
-      embed
-        .setTitle('🔴 MINECRAFT SERVER STATUS: OFFLINE')
-        .setColor('#e74c3c')
-        .addFields(
-          { name: '🌐 Server IP', value: `\`${serverIp}\``, inline: true },
-          { name: '⚠️ Status', value: 'Server is currently offline or restarting.', inline: false }
-        )
-        .setFooter({ text: 'Auto-updated every 3 minutes' });
-    }
+    const data = await fetchMCData(serverIp, db.mcStatus.bedrockPort);
+    const embed = buildMCEmbed(data);
 
     await message.edit({ embeds: [embed] });
   } catch (err) {
@@ -464,14 +531,50 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
+// Note: short/ambiguous abbreviations like "mc" and "bc" were removed on purpose —
+// they collide with normal words (e.g. "mc" in "Minecraft") and caused false flags.
 const badWords = [
-  'chutiya', 'chutiye', 'chootiya', 'madarchod', 'mc', 'bhenchod', 'bc', 'bhosdike', 
-  'bhosdi', 'gandu', 'randi', 'randwa', 'kaminey', 'kamina', 'harami', 
-  'laude', 'loda', 'lund', 'chut', 'choot', 'hijra', 'chhakka', 'bkl', 'tatte', 
+  'chutiya', 'chutiye', 'chootiya', 'madarchod', 'madarchood', 'bhenchod', 'behnchod', 'bhosdike',
+  'bhosdi', 'gandu', 'gandiya', 'randi', 'randwa', 'kaminey', 'kamina', 'harami',
+  'laude', 'loda', 'lund', 'lauda', 'chut', 'choot', 'hijra', 'chhakka', 'bkl', 'tatte',
   'gaand', 'gand', 'jhaat', 'bhadwa', 'bhadwe', 'suar', 'kutte', 'kutta',
-  'fuck', 'fucker', 'motherfucker', 'shit', 'bitch', 'asshole', 'bastard', 
+  'fuck', 'fucker', 'motherfucker', 'shit', 'bitch', 'asshole', 'bastard',
   'cunt', 'dick', 'pussy', 'cock', 'slut', 'whore', 'nigger', 'retard'
 ];
+
+// Matches only whole/standalone occurrences of a bad word (not as a substring of
+// another normal word), so e.g. "minecraft" or "backup" never falsely trigger.
+function containsBadWord(text) {
+  const lower = text.toLowerCase();
+  return badWords.some(word => {
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(?:^|[^a-z0-9])${escaped}(?:[^a-z0-9]|$)`, 'i');
+    return re.test(lower);
+  });
+}
+
+// Links to platforms that are fine to share (YouTube videos, GIF/clip sites, Discord's
+// own media CDN, common image hosts). Anything else with a raw link still gets flagged,
+// so scam/phishing links keep getting caught while normal sharing isn't punished.
+const SAFE_LINK_DOMAINS = [
+  'youtube.com', 'youtu.be', 'music.youtube.com',
+  'tenor.com', 'giphy.com', 'klipy.com', 'klipy.co', 'klip.gg',
+  'media.discordapp.net', 'cdn.discordapp.com', 'discord.com/channels',
+  'imgur.com', 'x.com', 'twitter.com'
+];
+
+function isSafeLink(text) {
+  const urls = text.match(/https?:\/\/[^\s]+/gi) || [];
+  if (urls.length === 0) return true;
+  return urls.every(u => {
+    try {
+      const host = new URL(u).hostname.replace(/^www\./i, '').toLowerCase();
+      return SAFE_LINK_DOMAINS.some(d => host === d || host.endsWith('.' + d));
+    } catch (e) {
+      return false;
+    }
+  });
+}
 
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
@@ -493,14 +596,21 @@ client.on('messageCreate', async (message) => {
     const userId = message.author.id;
     let violationReason = null;
 
-    const hasBadWord = badWords.some(word => msgContentLower.includes(word));
+    const hasBadWord = containsBadWord(message.content);
     if (hasBadWord) {
       violationReason = 'Toxic / Vulgar Language';
     }
 
-    const hasLink = msgContentLower.includes('http://') || msgContentLower.includes('https://') || msgContentLower.includes('discord.gg/') || msgContentLower.includes('discord.com/invite/');
-    if (hasLink && !violationReason) {
-      violationReason = 'Unauthorized Link / Invite Scam';
+    const hasInvite = msgContentLower.includes('discord.gg/') ||
+      msgContentLower.includes('discord.com/invite/') ||
+      msgContentLower.includes('discordapp.com/invite/');
+    if (hasInvite && !violationReason) {
+      violationReason = 'Unauthorized Server Invite Link';
+    }
+
+    const hasRawLink = /https?:\/\//i.test(msgContentLower);
+    if (hasRawLink && !violationReason && !isSafeLink(message.content)) {
+      violationReason = 'Unauthorized / Unrecognized Link';
     }
 
     if (message.mentions.users.size >= 4 && !violationReason) {
@@ -743,19 +853,20 @@ client.on('messageCreate', async (message) => {
 
     const smpArgs = cmdString.split(/\s+/);
     const ip = smpArgs[1];
+    const bedrockPort = smpArgs[2] ? parseInt(smpArgs[2]) : null;
 
     if (!ip) {
-      return message.reply('❌ Please provide server IP! Usage: `sp smp-set <ip>` or `sp smp-set <ip:port>`');
+      return message.reply('❌ Please provide server IP! Usage: `sp smp-set <ip>` or `sp smp-set <ip:port> [bedrockPort]`');
     }
 
     const initEmbed = new EmbedBuilder()
       .setTitle('⏳ Fetching Minecraft Status...')
       .setColor('#f1c40f')
-      .setDescription(`Connecting to PixelForge IP: \`${ip}\`...`);
+      .setDescription(`Connecting to \`${ip}\`...`);
 
     const statusMsg = await message.channel.send({ embeds: [initEmbed] });
 
-    db.mcStatus = { channelId: message.channel.id, messageId: statusMsg.id, ip: ip };
+    db.mcStatus = { channelId: message.channel.id, messageId: statusMsg.id, ip: ip, bedrockPort: bedrockPort };
     saveData(db);
 
     await message.delete().catch(() => {});
@@ -777,29 +888,9 @@ client.on('messageCreate', async (message) => {
     }
 
     const tempMsg = await message.reply('🔍 Fetching live Minecraft status...');
-    
-    const { isOnline, playersOnline, version, motd } = await fetchMCData(serverIp);
-    const embed = new EmbedBuilder().setTimestamp();
 
-    if (isOnline) {
-      embed
-        .setTitle('🟢 MINECRAFT SERVER STATUS: ONLINE')
-        .setColor('#2ecc71')
-        .addFields(
-          { name: '🌐 Server IP', value: `\`${serverIp}\``, inline: true },
-          { name: '👥 Players Online', value: `\`${playersOnline}\``, inline: true },
-          { name: '📌 Version', value: `\`${version}\``, inline: true },
-          { name: '📝 Description', value: `\`\`\`${motd}\`\`\`` }
-        );
-    } else {
-      embed
-        .setTitle('🔴 MINECRAFT SERVER STATUS: OFFLINE')
-        .setColor('#e74c3c')
-        .addFields(
-          { name: '🌐 Server IP', value: `\`${serverIp}\``, inline: true },
-          { name: '⚠️ Status', value: 'Server is currently offline or restarting.', inline: false }
-        );
-    }
+    const data = await fetchMCData(serverIp, db.mcStatus?.ip === serverIp ? db.mcStatus.bedrockPort : null);
+    const embed = buildMCEmbed(data);
 
     return tempMsg.edit({ content: '', embeds: [embed] });
   }
@@ -876,7 +967,7 @@ client.on('messageCreate', async (message) => {
         },
         { 
           name: '👑 Admin Commands', 
-          value: '`sp smp-set <ip>` - Setup auto-updating status panel.\n`sp yt-setup <yt_channel_id>` - Setup YouTube upload notifications.\n`sp lock` / `sp unlock` - Channel control.\n`sp slock @user` / `sp sunlock @user` - User/bot channel lock.\n`sp purge <count>` or `sp purge @user <count>` or `sp purge @user <min>min` - Purge control.\n`sp roles-panel` - Post dynamic role panel.' 
+          value: '`sp smp-set <ip> [bedrockPort]` - Setup auto-updating status panel (Java + Bedrock).\n`sp yt-setup <yt_channel_id>` - Setup YouTube upload notifications.\n`sp lock` / `sp unlock` - Channel control.\n`sp slock @user` / `sp sunlock @user` - User/bot channel lock.\n`sp purge <count>` or `sp purge @user <count>` or `sp purge @user <min>min` - Purge control.\n`sp roles-panel` - Post dynamic role panel.' 
         }
       )
       .setFooter({ text: 'Nethrion SMP Admin Control' })

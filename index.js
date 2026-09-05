@@ -846,66 +846,108 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // --- ENHANCED PURGE COMMAND ---
+  // --- PROFESSIONAL PURGE SYSTEM ---
+  // Modes: `sp purge <count>`, `sp purge @user <count>`, `sp purge @user <minutes>min`
+  // Safety: max 100 per run (Discord's own bulk-delete cap), and anything over 20
+  // requires the literal word `confirm` at the end — stops accidental/careless mass deletes.
   if (subCmd === 'purge') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
       return message.reply('❌ Requires Manage Messages permission!');
     }
 
+    const PURGE_MAX = 100;
+    const CONFIRM_THRESHOLD = 20;
+
+    const purgeEmbed = (title, desc, color) =>
+      new EmbedBuilder().setTitle(title).setDescription(desc).setColor(color).setTimestamp();
+
     const targetUser = message.mentions.users.first();
-    const otherArgs = args.slice(1).filter(arg => !arg.startsWith('<@'));
+    let rest = args.slice(1).filter(a => !a.startsWith('<@'));
 
-    if (targetUser) {
-      const rawArg = otherArgs[0] || '10';
-      if (rawArg.toLowerCase().includes('min')) {
-        const minutes = parseInt(rawArg);
-        if (isNaN(minutes)) return message.reply('❌ Minutes must be a valid number! Usage: `sp purge @user 10min`');
-
-        const now = Date.now();
-        const timeCutoff = now - (minutes * 60 * 1000);
-
-        const fetchedMessages = await message.channel.messages.fetch({ limit: 100 });
-        const userMessagesToDelete = fetchedMessages.filter(
-          m => m.author.id === targetUser.id && m.createdTimestamp >= timeCutoff
-        );
-
-        if (userMessagesToDelete.size === 0) {
-          return message.reply(`❌ No messages found from ${targetUser.username} in the last ${minutes} minutes.`);
-        }
-
-        await message.channel.bulkDelete(userMessagesToDelete, true);
-        await message.delete().catch(() => {});
-        const confirmMsg = await message.channel.send(`🧹 Deleted **${userMessagesToDelete.size}** messages from ${targetUser.username} from the last **${minutes}** minutes.`);
-        setTimeout(() => confirmMsg.delete().catch(() => {}), 4000);
-        return;
-      } else {
-        const count = parseInt(rawArg) || 10;
-        const fetchedMessages = await message.channel.messages.fetch({ limit: 100 });
-        const userMsgs = fetchedMessages.filter(m => m.author.id === targetUser.id);
-        const toDelete = Array.from(userMsgs.values()).slice(0, count);
-
-        if (toDelete.length === 0) {
-          return message.reply(`❌ No messages found from ${targetUser.username}.`);
-        }
-
-        await message.channel.bulkDelete(toDelete, true);
-        await message.delete().catch(() => {});
-        const confirmMsg = await message.channel.send(`🧹 Deleted **${toDelete.length}** messages from ${targetUser.username}.`);
-        setTimeout(() => confirmMsg.delete().catch(() => {}), 4000);
-        return;
-      }
+    let hasConfirm = false;
+    if (rest.length && rest[rest.length - 1].toLowerCase() === 'confirm') {
+      hasConfirm = true;
+      rest = rest.slice(0, -1);
     }
 
-    let countArg = (args[1] && args[1].toLowerCase() === 'all') ? args[2] : args[1];
-    const count = parseInt(countArg) || 10;
-    if (isNaN(count) || count < 1 || count > 100) {
-      return message.reply('❌ Specify number between 1-100 or use `sp purge @user <count>` / `sp purge @user <minutes>min`!');
+    const sendResult = async (count, scopeText) => {
+      await message.delete().catch(() => {});
+      const resultEmbed = purgeEmbed('🧹 Purge Complete', `Deleted **${count}** message${count === 1 ? '' : 's'}${scopeText}.`, '#2ecc71')
+        .setFooter({ text: `Purged by ${message.author.tag}` });
+      const resultMsg = await message.channel.send({ embeds: [resultEmbed] });
+      setTimeout(() => resultMsg.delete().catch(() => {}), 6000);
+    };
+
+    // --- User + time window: sp purge @user <minutes>min [confirm] ---
+    if (targetUser && rest[0] && /^\d+min$/i.test(rest[0])) {
+      const minutes = parseInt(rest[0], 10);
+      const fetched = await message.channel.messages.fetch({ limit: 100 });
+      const cutoff = Date.now() - minutes * 60 * 1000;
+      let matched = Array.from(fetched.values())
+        .filter(m => m.author.id === targetUser.id && m.createdTimestamp >= cutoff)
+        .slice(0, PURGE_MAX);
+
+      if (matched.length === 0) {
+        return message.reply({ embeds: [purgeEmbed('❌ No Messages Found', `No messages from **${targetUser.username}** in the last **${minutes}** minute(s).`, '#e74c3c')] });
+      }
+
+      if (matched.length > CONFIRM_THRESHOLD && !hasConfirm) {
+        return message.reply({ embeds: [purgeEmbed(
+          '⚠️ Confirmation Required',
+          `You're about to delete **${matched.length}** messages from **${targetUser.username}** (last ${minutes} min).\nAdd \`confirm\` at the end to proceed:\n\`sp purge @${targetUser.username} ${minutes}min confirm\``,
+          '#f1c40f'
+        )] });
+      }
+
+      await message.channel.bulkDelete(matched, true);
+      return sendResult(matched.length, ` from **${targetUser.username}** (last ${minutes} min)`);
+    }
+
+    // --- User + count: sp purge @user <count> [confirm] ---
+    if (targetUser) {
+      let count = Math.min(Math.max(parseInt(rest[0], 10) || 10, 1), PURGE_MAX);
+
+      if (count > CONFIRM_THRESHOLD && !hasConfirm) {
+        return message.reply({ embeds: [purgeEmbed(
+          '⚠️ Confirmation Required',
+          `You're about to delete **${count}** messages from **${targetUser.username}**.\nAdd \`confirm\` at the end to proceed:\n\`sp purge @${targetUser.username} ${count} confirm\``,
+          '#f1c40f'
+        )] });
+      }
+
+      const fetched = await message.channel.messages.fetch({ limit: 100 });
+      const userMsgs = Array.from(fetched.values()).filter(m => m.author.id === targetUser.id).slice(0, count);
+
+      if (userMsgs.length === 0) {
+        return message.reply({ embeds: [purgeEmbed('❌ No Messages Found', `No recent messages found from **${targetUser.username}**.`, '#e74c3c')] });
+      }
+
+      await message.channel.bulkDelete(userMsgs, true);
+      return sendResult(userMsgs.length, ` from **${targetUser.username}**`);
+    }
+
+    // --- Plain count: sp purge <count> [confirm] ---
+    const rawCount = parseInt(rest[0], 10);
+    if (isNaN(rawCount) || rawCount < 1) {
+      return message.reply({ embeds: [purgeEmbed(
+        '📖 Purge Command Guide',
+        '`sp purge <count>` — delete the last N messages (max 100)\n`sp purge @user <count>` — delete N messages from a specific user\n`sp purge @user <minutes>min` — delete a user\'s messages from the last N minutes\n\nDeleting **more than 20** messages requires adding `confirm` at the end.',
+        '#3498db'
+      )] });
+    }
+
+    const count = Math.min(rawCount, PURGE_MAX);
+
+    if (count > CONFIRM_THRESHOLD && !hasConfirm) {
+      return message.reply({ embeds: [purgeEmbed(
+        '⚠️ Confirmation Required',
+        `You're about to delete **${count}** messages in this channel. This cannot be undone.\nAdd \`confirm\` at the end to proceed:\n\`sp purge ${count} confirm\``,
+        '#f1c40f'
+      )] });
     }
 
     await message.channel.bulkDelete(count + 1, true);
-    const confirmMsg = await message.channel.send(`🧹 Purged **${count}** messages.`);
-    setTimeout(() => confirmMsg.delete().catch(() => {}), 4000);
-    return;
+    return sendResult(count, ' from this channel');
   }
 
   if (cmdLower === 'roles-panel') {
@@ -1088,7 +1130,7 @@ client.on('messageCreate', async (message) => {
         },
         { 
           name: '👑 Admin Commands', 
-          value: '`sp smp-panel` - (Owner only) Setup live auto-updating SMP panel with player list.\n`sp yt-setup <yt_channel_id>` - Setup YouTube upload notifications.\n`sp lock` / `sp unlock` - Channel control.\n`sp slock @user` / `sp sunlock @user` - User/bot channel lock.\n`sp purge <count>` or `sp purge @user <count>` or `sp purge @user <min>min` - Purge control.\n`sp roles-panel` - Post dynamic role panel.' 
+          value: '`sp smp-panel` - (Owner only) Setup live auto-updating SMP panel with player list.\n`sp yt-setup <yt_channel_id>` - Setup YouTube upload notifications.\n`sp lock` / `sp unlock` - Channel control.\n`sp slock @user` / `sp sunlock @user` - User/bot channel lock.\n`sp purge <count>` / `sp purge @user <count>` / `sp purge @user <min>min` - Max 100, needs `confirm` at the end if over 20.\n`sp roles-panel` - Post dynamic role panel.' 
         }
       )
       .setFooter({ text: 'Nethrion SMP Admin Control' })

@@ -34,6 +34,12 @@ const DATA_FILE = './data.json';
 const tempVCs = new Set();
 const userSelectedChannels = new Map();
 
+// Nethrion SMP — fixed server details for the owner-only live panel (`sp smp-panel`).
+const NETHRION_JAVA_HOST = 'nethrionsmp.pixelforge.gg';
+const NETHRION_JAVA_PORT = 25565;
+const NETHRION_BEDROCK_HOST = '15.235.165.81';
+const NETHRION_BEDROCK_PORT = 26091;
+
 function saveData(data) {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 }
@@ -41,7 +47,7 @@ function saveData(data) {
 function loadData() {
   if (!fs.existsSync(DATA_FILE)) {
     const initData = { 
-      mcStatus: { channelId: null, messageId: null, ip: null }, 
+      mcPanel: { channelId: null, messageId: null }, 
       ytConfig: { channelId: null, ytChannelId: null, lastVideoId: null }, 
       streaks: {} 
     };
@@ -51,12 +57,13 @@ function loadData() {
   try {
     const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
     if (!parsed.ytConfig) parsed.ytConfig = { channelId: null, ytChannelId: null, lastVideoId: null };
-    if (!parsed.mcStatus) parsed.mcStatus = { channelId: null, messageId: null, ip: null };
+    if (!parsed.mcPanel) parsed.mcPanel = { channelId: null, messageId: null };
     return parsed;
   } catch (e) {
-    return { mcStatus: { ip: null }, ytConfig: {}, streaks: {} };
+    return { mcPanel: { channelId: null, messageId: null }, ytConfig: {}, streaks: {} };
   }
 }
+
 
 function getTodayString() {
   return new Date().toISOString().split('T')[0];
@@ -76,26 +83,79 @@ function cleanMotd(text) {
 
 const DEFAULT_BEDROCK_PORT = 19132;
 
-// Fetches live Java + Bedrock status. Java is retried once (with a short delay)
-// before being declared offline, so a single dropped packet / lag spike doesn't
-// falsely flag the server as down. Bedrock is treated as optional/best-effort.
-async function fetchMCData(ip, bedrockPort) {
-  let host = ip;
-  let port = 25565;
+// Simple Java-only status check, used by the public `sp smp` command (works for any
+// server, including ones we have no Bedrock/extra data for). Retries once before
+// declaring offline, so a single dropped packet doesn't produce a false "offline".
+async function fetchJavaStatus(host, port) {
+  let result = null;
+  let online = false;
 
-  if (ip.includes(':')) {
-    const parts = ip.split(':');
-    host = parts[0];
-    port = parseInt(parts[1]) || 25565;
+  for (let attempt = 0; attempt < 2 && !online; attempt++) {
+    try {
+      result = await mcs.status(host, port, { timeout: 7000, enableSRV: true });
+      online = true;
+    } catch (err) {
+      if (attempt === 0) await new Promise(r => setTimeout(r, 1200));
+    }
   }
-  const bPort = parseInt(bedrockPort) || DEFAULT_BEDROCK_PORT;
 
+  if (!online || !result) {
+    return { isOnline: false, playersOnline: '0/0', version: 'N/A', motd: 'Server is Offline or Starting...' };
+  }
+
+  const playersOnline = (result.players && result.players.online !== undefined)
+    ? `${result.players.online}/${result.players.max}` : '0/0';
+
+  const rawVersion = result.version && result.version.name ? result.version.name : '';
+  let version = cleanMotd(rawVersion) || '1.20+';
+  if (!version || version.toLowerCase().includes('online') || version.length > 25) version = '1.20+';
+
+  let rawMotd = '';
+  if (result.motd) rawMotd = result.motd.clean || result.motd.raw || '';
+  const motd = cleanMotd(rawMotd) || 'A Minecraft Server';
+
+  return { isOnline: true, playersOnline, version, motd };
+}
+
+// Classic minimal embed for `sp smp` — same style everyone is used to.
+function buildSimpleMCEmbed(ip, data) {
+  const embed = new EmbedBuilder().setTimestamp();
+
+  if (data.isOnline) {
+    embed
+      .setTitle('🟢 MINECRAFT SERVER STATUS: ONLINE')
+      .setColor('#2ecc71')
+      .addFields(
+        { name: '🌐 Server IP', value: `\`${ip}\``, inline: true },
+        { name: '👥 Players Online', value: `\`${data.playersOnline}\``, inline: true },
+        { name: '📌 Version', value: `\`${data.version}\``, inline: true },
+        { name: '📝 Description', value: `\`\`\`${data.motd}\`\`\`` }
+      );
+  } else {
+    embed
+      .setTitle('🔴 MINECRAFT SERVER STATUS: OFFLINE')
+      .setColor('#e74c3c')
+      .addFields(
+        { name: '🌐 Server IP', value: `\`${ip}\``, inline: true },
+        { name: '⚠️ Status', value: 'Server is currently offline or restarting.', inline: false }
+      );
+  }
+
+  return embed;
+}
+
+// Full Java + Bedrock status (separate hosts supported), used only by the
+// owner-only live panel (`sp smp-panel`) since that's the only server we
+// have complete Java+Bedrock details for. Bedrock ping is retried too —
+// Bedrock's RakNet ping is UDP-based and drops packets more often than TCP,
+// so a single failed attempt should not be treated as "no Bedrock support".
+async function fetchFullStatus(javaHost, javaPort, bedrockHost, bedrockPort) {
   let javaResult = null;
   let javaOnline = false;
 
   for (let attempt = 0; attempt < 2 && !javaOnline; attempt++) {
     try {
-      javaResult = await mcs.status(host, port, { timeout: 7000, enableSRV: !ip.includes(':') });
+      javaResult = await mcs.status(javaHost, javaPort, { timeout: 7000, enableSRV: true });
       javaOnline = true;
     } catch (err) {
       if (attempt === 0) await new Promise(r => setTimeout(r, 1200));
@@ -104,15 +164,24 @@ async function fetchMCData(ip, bedrockPort) {
 
   let bedrockResult = null;
   let bedrockOnline = false;
-  try {
-    bedrockResult = await mcs.statusBedrock(host, bPort, { timeout: 5000 });
-    bedrockOnline = true;
-  } catch (err) {
-    bedrockOnline = false;
+  let bedrockError = null;
+
+  for (let attempt = 0; attempt < 2 && !bedrockOnline; attempt++) {
+    try {
+      bedrockResult = await mcs.statusBedrock(bedrockHost, bedrockPort, { timeout: 6000, enableSRV: false });
+      bedrockOnline = true;
+    } catch (err) {
+      bedrockError = err && err.message ? err.message : String(err);
+      if (attempt === 0) await new Promise(r => setTimeout(r, 1200));
+    }
   }
 
-  const javaIp = `${host}:${port}`;
-  const bedrockIp = `${host}:${bPort}`;
+  if (bedrockError) {
+    console.error('[Bedrock Ping Error]:', bedrockError);
+  }
+
+  const javaIp = javaPort === 25565 ? javaHost : `${javaHost}:${javaPort}`;
+  const bedrockIp = `${bedrockHost}:${bedrockPort}`;
 
   if (!javaOnline && !bedrockOnline) {
     return {
@@ -167,8 +236,12 @@ async function fetchMCData(ip, bedrockPort) {
   return { isOnline: true, playersOnline, version, motd, playerList, javaIp, bedrockIp, bedrockOnline };
 }
 
-// Builds the compact, minimal status embed shared by the auto-updating panel and `sp smp`.
-function buildMCEmbed(data) {
+// Rich, minimal panel embed — Java IP, Bedrock IP, live player count + names.
+// Used only by the owner-only auto-updating panel (`sp smp-panel`).
+// The Bedrock address is always shown (it's a fixed, known value) — only the
+// small status dot next to it reflects whether the live ping succeeded, since
+// Bedrock pings can fail intermittently even while the server is genuinely up.
+function buildPanelEmbed(data) {
   const { isOnline, playersOnline, version, motd, playerList, javaIp, bedrockIp, bedrockOnline } = data;
 
   const embed = new EmbedBuilder().setTimestamp();
@@ -190,7 +263,7 @@ function buildMCEmbed(data) {
     .setColor('#2ecc71')
     .addFields(
       { name: '🌐 Java IP', value: `\`${javaIp}\``, inline: true },
-      { name: '📱 Bedrock IP', value: bedrockOnline ? `\`${bedrockIp}\`` : '`Not available`', inline: true },
+      { name: `📱 Bedrock IP ${bedrockOnline ? '🟢' : '🟠'}`, value: `\`${bedrockIp}\``, inline: true },
       { name: '👥 Players', value: `\`${playersOnline}\``, inline: true },
       { name: '🧩 Version', value: `\`${version}\``, inline: true }
     );
@@ -202,28 +275,33 @@ function buildMCEmbed(data) {
   }
 
   embed.setDescription(`*${motd.length > 90 ? motd.slice(0, 90) + '…' : motd}*`);
-  embed.setFooter({ text: 'Auto-updates every 3 minutes' });
+  embed.setFooter({ text: bedrockOnline ? 'Auto-updates every 3 minutes' : 'Auto-updates every 3 minutes • Bedrock ping unreachable right now' });
   return embed;
 }
 
-async function updateMCStatus() {
+async function updateMCPanel() {
   const db = loadData();
-  if (!db.mcStatus || !db.mcStatus.channelId || !db.mcStatus.messageId || !db.mcStatus.ip) return;
+  if (!db.mcPanel || !db.mcPanel.channelId || !db.mcPanel.messageId) return;
 
   try {
-    const channel = await client.channels.fetch(db.mcStatus.channelId).catch(() => null);
+    const channel = await client.channels.fetch(db.mcPanel.channelId).catch((e) => {
+      console.error('[MC Panel] Could not fetch channel:', e.message);
+      return null;
+    });
     if (!channel) return;
 
-    const message = await channel.messages.fetch(db.mcStatus.messageId).catch(() => null);
+    const message = await channel.messages.fetch(db.mcPanel.messageId).catch((e) => {
+      console.error('[MC Panel] Could not fetch panel message (was it deleted?):', e.message);
+      return null;
+    });
     if (!message) return;
 
-    const serverIp = db.mcStatus.ip;
-    const data = await fetchMCData(serverIp, db.mcStatus.bedrockPort);
-    const embed = buildMCEmbed(data);
+    const data = await fetchFullStatus(NETHRION_JAVA_HOST, NETHRION_JAVA_PORT, NETHRION_BEDROCK_HOST, NETHRION_BEDROCK_PORT);
+    const embed = buildPanelEmbed(data);
 
     await message.edit({ embeds: [embed] });
   } catch (err) {
-    console.error('[MC Status Error]:', err.message);
+    console.error('[MC Panel Error]:', err.message);
   }
 }
 
@@ -266,7 +344,7 @@ client.once('ready', () => {
   console.log(`🔥 Spark Bot is ONLINE as ${client.user.tag}`);
   console.log(`=================================\n`);
 
-  setInterval(updateMCStatus, 3 * 60 * 1000);
+  setInterval(updateMCPanel, 3 * 60 * 1000);
   setInterval(checkYouTubeUploads, 5 * 60 * 1000);
 });
 
@@ -846,51 +924,58 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  if (subCmd === 'smp-set') {
-    if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
-      return message.reply('❌ This command is restricted to Admins!');
+  if (subCmd === 'smp-panel') {
+    if (message.author.id !== message.guild.ownerId) {
+      return message.reply('❌ This command is restricted to the server owner only!');
     }
 
-    const smpArgs = cmdString.split(/\s+/);
-    const ip = smpArgs[1];
-    const bedrockPort = smpArgs[2] ? parseInt(smpArgs[2]) : null;
+    try {
+      const initEmbed = new EmbedBuilder()
+        .setTitle('⏳ Setting up live SMP panel...')
+        .setColor('#f1c40f')
+        .setDescription('Connecting to Nethrion SMP...');
 
-    if (!ip) {
-      return message.reply('❌ Please provide server IP! Usage: `sp smp-set <ip>` or `sp smp-set <ip:port> [bedrockPort]`');
+      const panelMsg = await message.channel.send({ embeds: [initEmbed] });
+
+      db.mcPanel = { channelId: message.channel.id, messageId: panelMsg.id };
+      saveData(db);
+
+      await message.delete().catch(() => {});
+      await updateMCPanel();
+    } catch (err) {
+      console.error('[SMP Panel Setup Error]:', err.message);
+      await message.channel.send(`⚠️ Couldn't set up the panel: \`${err.message}\`. Check bot permissions (Send Messages, Manage Messages) in this channel.`).catch(() => {});
     }
-
-    const initEmbed = new EmbedBuilder()
-      .setTitle('⏳ Fetching Minecraft Status...')
-      .setColor('#f1c40f')
-      .setDescription(`Connecting to \`${ip}\`...`);
-
-    const statusMsg = await message.channel.send({ embeds: [initEmbed] });
-
-    db.mcStatus = { channelId: message.channel.id, messageId: statusMsg.id, ip: ip, bedrockPort: bedrockPort };
-    saveData(db);
-
-    await message.delete().catch(() => {});
-    await updateMCStatus();
     return;
   }
 
   if (subCmd === 'smp') {
     const smpArgs = cmdString.split(/\s+/);
-    
+
     if (smpArgs[1] && !message.member.permissions.has(PermissionFlagsBits.Administrator)) {
       return message.reply('❌ Custom IP check is restricted to Admins! Use `sp smp` directly.');
     }
 
-    const serverIp = smpArgs[1] || db.mcStatus?.ip;
+    let host = NETHRION_JAVA_HOST;
+    let port = NETHRION_JAVA_PORT;
+    let displayIp = NETHRION_JAVA_HOST;
 
-    if (!serverIp) {
-      return message.reply('❌ Server IP is not configured yet! Ask an admin to run `sp smp-set <ip>`.');
+    if (smpArgs[1]) {
+      displayIp = smpArgs[1];
+      if (displayIp.includes(':')) {
+        const parts = displayIp.split(':');
+        host = parts[0];
+        port = parseInt(parts[1]) || 25565;
+      } else {
+        host = displayIp;
+        port = 25565;
+      }
     }
 
     const tempMsg = await message.reply('🔍 Fetching live Minecraft status...');
 
-    const data = await fetchMCData(serverIp, db.mcStatus?.ip === serverIp ? db.mcStatus.bedrockPort : null);
-    const embed = buildMCEmbed(data);
+    const data = await fetchJavaStatus(host, port);
+    const embed = buildSimpleMCEmbed(displayIp, data);
 
     return tempMsg.edit({ content: '', embeds: [embed] });
   }
@@ -967,7 +1052,7 @@ client.on('messageCreate', async (message) => {
         },
         { 
           name: '👑 Admin Commands', 
-          value: '`sp smp-set <ip> [bedrockPort]` - Setup auto-updating status panel (Java + Bedrock).\n`sp yt-setup <yt_channel_id>` - Setup YouTube upload notifications.\n`sp lock` / `sp unlock` - Channel control.\n`sp slock @user` / `sp sunlock @user` - User/bot channel lock.\n`sp purge <count>` or `sp purge @user <count>` or `sp purge @user <min>min` - Purge control.\n`sp roles-panel` - Post dynamic role panel.' 
+          value: '`sp smp-panel` - (Owner only) Setup live auto-updating SMP panel with player list.\n`sp yt-setup <yt_channel_id>` - Setup YouTube upload notifications.\n`sp lock` / `sp unlock` - Channel control.\n`sp slock @user` / `sp sunlock @user` - User/bot channel lock.\n`sp purge <count>` or `sp purge @user <count>` or `sp purge @user <min>min` - Purge control.\n`sp roles-panel` - Post dynamic role panel.' 
         }
       )
       .setFooter({ text: 'Nethrion SMP Admin Control' })

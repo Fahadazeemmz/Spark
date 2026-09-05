@@ -149,6 +149,23 @@ function buildSimpleMCEmbed(ip, data) {
 // have complete Java+Bedrock details for. Bedrock ping is retried too —
 // Bedrock's RakNet ping is UDP-based and drops packets more often than TCP,
 // so a single failed attempt should not be treated as "no Bedrock support".
+// The Server List Ping "sample" field is only a partial, best-effort preview of
+// online players — some server softwares/plugins leave it empty even when
+// players are online. If that happens, fall back to the Query protocol, which
+// returns the real, complete player list — but it only works if the server
+// owner has enabled it (enable-query=true in server.properties).
+async function fetchPlayerListViaQuery(host, port) {
+  try {
+    const q = await mcs.queryFull(host, port, { timeout: 5000, enableSRV: false });
+    if (q && Array.isArray(q.players)) {
+      return q.players.map(p => cleanMotd(p)).filter(Boolean);
+    }
+  } catch (err) {
+    // Query protocol is disabled or unreachable — not fatal, just no name list.
+  }
+  return [];
+}
+
 async function fetchFullStatus(javaHost, javaPort, bedrockHost, bedrockPort) {
   let javaResult = null;
   let javaOnline = false;
@@ -231,6 +248,14 @@ async function fetchFullStatus(javaHost, javaPort, bedrockHost, bedrockPort) {
     if (cleanedVersion) version = cleanedVersion;
     const cleanedMotd = cleanMotd(bedrockResult.motd && (bedrockResult.motd.clean || bedrockResult.motd.raw));
     if (cleanedMotd) motd = cleanedMotd;
+  }
+
+  // "sample" often comes back empty even with players online — try Query protocol as a backup.
+  if (javaOnline && playerList.length === 0) {
+    const onlineCount = parseInt(playersOnline.split('/')[0], 10) || 0;
+    if (onlineCount > 0) {
+      playerList = await fetchPlayerListViaQuery(javaHost, javaPort);
+    }
   }
 
   return { isOnline: true, playersOnline, version, motd, playerList, javaIp, bedrockIp, bedrockOnline };
@@ -930,15 +955,24 @@ client.on('messageCreate', async (message) => {
     }
 
     try {
-      const initEmbed = new EmbedBuilder()
-        .setTitle('⏳ Setting up live SMP panel...')
-        .setColor('#f1c40f')
-        .setDescription('Connecting to Nethrion SMP...');
+      let reused = false;
 
-      const panelMsg = await message.channel.send({ embeds: [initEmbed] });
+      if (db.mcPanel && db.mcPanel.channelId === message.channel.id && db.mcPanel.messageId) {
+        const existing = await message.channel.messages.fetch(db.mcPanel.messageId).catch(() => null);
+        if (existing) reused = true;
+      }
 
-      db.mcPanel = { channelId: message.channel.id, messageId: panelMsg.id };
-      saveData(db);
+      if (!reused) {
+        const initEmbed = new EmbedBuilder()
+          .setTitle('⏳ Setting up live SMP panel...')
+          .setColor('#f1c40f')
+          .setDescription('Connecting to Nethrion SMP...');
+
+        const panelMsg = await message.channel.send({ embeds: [initEmbed] });
+
+        db.mcPanel = { channelId: message.channel.id, messageId: panelMsg.id };
+        saveData(db);
+      }
 
       await message.delete().catch(() => {});
       await updateMCPanel();

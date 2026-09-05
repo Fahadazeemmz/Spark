@@ -280,7 +280,7 @@ function buildPanelEmbed(data) {
         { name: '📱 Bedrock IP', value: `\`${bedrockIp}\``, inline: true }
       )
       .setDescription('Server is currently offline or restarting.')
-      .setFooter({ text: 'Auto-updates every 3 minutes' });
+      .setFooter({ text: 'Auto-updates every 30s' });
   }
 
   embed
@@ -300,7 +300,7 @@ function buildPanelEmbed(data) {
   }
 
   embed.setDescription(`*${motd.length > 90 ? motd.slice(0, 90) + '…' : motd}*`);
-  embed.setFooter({ text: bedrockOnline ? 'Auto-updates every 3 minutes' : 'Auto-updates every 3 minutes • Bedrock ping unreachable right now' });
+  embed.setFooter({ text: bedrockOnline ? 'Auto-updates every 30s' : 'Auto-updates every 30s • Bedrock ping unreachable right now' });
   return embed;
 }
 
@@ -369,7 +369,9 @@ client.once('ready', () => {
   console.log(`🔥 Spark Bot is ONLINE as ${client.user.tag}`);
   console.log(`=================================\n`);
 
-  setInterval(updateMCPanel, 3 * 60 * 1000);
+  // 30s is the safe floor: fast enough to feel "live", but won't risk Discord's
+  // message-edit rate limit or hammer the Minecraft server with pings.
+  setInterval(updateMCPanel, 30 * 1000);
   setInterval(checkYouTubeUploads, 5 * 60 * 1000);
 });
 
